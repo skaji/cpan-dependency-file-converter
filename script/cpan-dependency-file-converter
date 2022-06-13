@@ -1,0 +1,139 @@
+#!perl
+use v5.36;
+use experimental qw(builtin defer for_list try);
+
+use CPAN::Meta;
+use Getopt::Long ();
+use JSON::PP ();
+use Module::CPANfile::Prereqs;
+use Module::CPANfile::Requirement;
+use Module::CPANfile;
+use Module::cpmfile;
+
+my $HELP = <<'EOF';
+Usage: cpan-dependency-file-converter [options] FILE
+
+Options:
+  -i  input dependency file type;  cpmfile, cpanfile or cpanmeta
+  -o  output dependency file type; cpmfile, cpanfile or cpanmeta; default: cpmfile
+  -h  show this help
+
+Examples:
+  $ cpan-dependency-file-converter cpanfile
+  $ cpan-dependency-file-converter META.json
+  $ cpan-dependency-file-converter -i cpanfile my-cpanfile -o cpanmeta
+EOF
+
+sub new ($class) {
+    bless {}, $class;
+}
+
+sub parse_argv ($self, @argv) {
+    my $parser = Getopt::Long::Parser->new;
+    $parser->getoptionsfromarray(\@argv,
+        "i=s" => \my $input_type,
+        "o=s" => \(my $output_type = "cpmfile"),
+        "help|h" => sub { print $HELP; exit 1 },
+    ) or exit 1;
+
+    my $file = shift @argv or die "missing file argument.\n";
+    if (!$input_type) {
+        if ($file =~ /META\.(json|yml)$/n) {
+            $input_type = "cpanmeta";
+        } elsif ($file =~ /cpanfile/) {
+            $input_type = "cpanfile";
+        } else {
+            $input_type = "cpmfile";
+        }
+    }
+    if ($input_type !~ /^(cpmfile|cpanfile|cpanmeta)$/n) {
+        die "unknown input type: $input_type\n";
+    }
+    if ($output_type !~ /^(cpmfile|cpanfile|cpanmeta)$/n) {
+        die "unknown output type: $output_type\n";
+    }
+    $self->{input_type} = $input_type;
+    $self->{output_type} = $output_type;
+    $file;
+}
+
+sub run ($self, @argv) {
+    my $file = $self->parse_argv(@argv);
+    my $cpmfile = $self->_read($file);
+    my $string = $self->_write($cpmfile);
+    print $string;
+}
+
+sub _read ($self, $file) {
+    my %read = (
+        cpmfile => sub ($file) {
+            Module::cpmfile->load($file);
+        },
+        cpanfile => sub ($file) {
+            Module::cpmfile->from_cpanfile(Module::CPANfile->load($file));
+        },
+        cpanmeta => sub ($file) {
+            Module::cpmfile->from_cpanmeta(CPAN::Meta->load_file($file));
+        },
+    );
+    $read{$self->{input_type}}->($file);
+}
+
+sub _write ($self, $cpmfile) {
+    my %write = (
+        cpmfile => sub ($cpmfile) {
+            $cpmfile->to_string;
+        },
+        cpanfile => sub ($cpmfile) {
+            my $cpanfile_prereqs = Module::CPANfile::Prereqs->new;
+            my $add = sub ($feature_id, $feature_description, $prereqs) {
+                if ($feature_id) {
+                    $cpanfile_prereqs->add_feature($feature_id, $feature_description);
+                }
+                $prereqs->walk(undef, undef, sub ($phase, $type, $package, $options) {
+                    my $req = Module::CPANfile::Requirement->new(name => $package, $options->%*);
+                    $cpanfile_prereqs->add(
+                        feature => $feature_id,
+                        phase => $phase,
+                        type => $type,
+                        module => $package,
+                        requirement => $req,
+                    );
+                });
+            };
+            $add->(undef, undef, $cpmfile->prereqs);
+            if (my $features = $cpmfile->features) {
+                for my ($id, $feature) ($features->%*) {
+                    $add->($id, $feature->{description}, $feature->{prereqs});
+                }
+            }
+            my $cpanfile = Module::CPANfile->new;
+            $cpanfile->{_prereqs} = $cpanfile_prereqs; # XXX
+            $cpanfile->to_string;
+        },
+        cpanmeta => sub ($cpmfile) {
+            my $optional_features;
+            if (my $features = $cpmfile->features) {
+                $optional_features = {};
+                for my ($id, $feature) ($features->%*) {
+                    $optional_features->{$id} = {
+                        $feature->{description} ? (description => $feature->{description}) : (),
+                        prereqs => $feature->{prereqs}->cpanmeta->as_string_hash,
+                    };
+                }
+            }
+            JSON::PP->new->canonical->pretty->encode({
+                name => '_',
+                dynamic_config => 0,
+                'meta-spec' => { version => 2 },
+                version => '0.01',
+                x_static_install => 1,
+                prereqs => $cpmfile->prereqs->cpanmeta->as_string_hash,
+                $optional_features ? (optional_features => $optional_features) : (),
+            });
+        },
+    );
+    $write{$self->{output_type}}->($cpmfile);
+}
+
+__PACKAGE__->new->run(@ARGV);
